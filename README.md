@@ -44,8 +44,11 @@ Open → `http://localhost:3000`
 
 ---
 
-## 👤 Team
-**Ramsundar** — Full Stack Developer
+## 👤 Team Sparks
+**Ramsundar** 
+**Gowtham**
+**Fardin**
+**Kishor**
 
 ---
 *Built with ❤️ for students everywhere*
