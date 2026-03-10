@@ -3,61 +3,25 @@ import LandingPage from "./pages/LandingPage";
 import AssessmentForm from "./pages/AssessmentForm";
 import LoadingAnalysis from "./pages/LoadingAnalysis";
 import ReportPage from "./pages/ReportPage";
+import "./styles/global.css";
 
 export default function App() {
-
   const [page, setPage] = useState("landing");
-  const [formData, setFormData] = useState(null);
-  const [report, setReport] = useState(null);
+  const [formData, setFormData] = useState({});
+  const [reportData, setReportData] = useState(null);
 
-  const handleStart = () => {
-    setPage("form");
-  };
-
- const handleSubmit = async (data) => {
-    setFormData(data);
-    setPage("loading");
-    try {
-      const res = await fetch("/api/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
-      });
-      const text = await res.text();
-      console.log("Response:", text);
-      const result = JSON.parse(text);
-      setReport(result);
-      setPage("report");
-    } catch (e) {
-      console.error("Error:", e);
-      alert("Error: " + e.message);
-      setPage("form");
-    }
-  };
-
-  const handleReset = () => {
-    setPage("landing");
-    setFormData(null);
-    setReport(null);
+  const navigate = (to, data = {}) => {
+    if (to === "loading") setFormData(data);
+    if (to === "report") setReportData(data);
+    setPage(to);
   };
 
   return (
-    <>
-      {page === "landing" && (
-        <LandingPage onStart={handleStart} />
-      )}
-
-      {page === "form" && (
-        <AssessmentForm onSubmit={handleSubmit} />
-      )}
-
-      {page === "loading" && (
-        <LoadingAnalysis />
-      )}
-
-      {page === "report" && report && (
-        <ReportPage report={report} onReset={handleReset} />
-      )}
-    </>
+    <div className="app-root">
+      {page === "landing" && <LandingPage onStart={() => navigate("form")} />}
+      {page === "form" && <AssessmentForm onSubmit={(d) => navigate("loading", d)} />}
+      {page === "loading" && <LoadingAnalysis formData={formData} onDone={(r) => navigate("report", r)} />}
+      {page === "report" && <ReportPage data={reportData} onRetake={() => navigate("form")} />}
+    </div>
   );
 }

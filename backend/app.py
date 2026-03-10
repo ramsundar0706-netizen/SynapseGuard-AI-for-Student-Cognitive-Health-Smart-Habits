@@ -1,237 +1,378 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import numpy as np
-from datetime import datetime
+import requests
+import json
+import os
+import anthropic
+from datetime import datetime, timedelta
 import random
 
 app = Flask(__name__)
 CORS(app)
 
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-    return response
+# Initialize Anthropic client
+client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
-# ── AQI fetch ──────────────────────────────────────────────────────────────────
-def fetch_aqi(city):
-    try:
-        import requests
-        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1"
-        geo_res = requests.get(geo_url, timeout=4).json()
-        if not geo_res.get("results"):
-            raise Exception("City not found")
-        lat = geo_res["results"][0]["latitude"]
-        lon = geo_res["results"][0]["longitude"]
-        aqi_url = f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat}&longitude={lon}&hourly=european_aqi&timezone=auto&forecast_days=1"
-        aqi_res = requests.get(aqi_url, timeout=4).json()
-        aqi_vals = [v for v in aqi_res.get("hourly", {}).get("european_aqi", []) if v is not None]
-        aqi = int(np.mean(aqi_vals[:6])) if aqi_vals else 55
-        if aqi <= 20:
-            status, tip = "Good", "Air quality is excellent! A 30-min outdoor walk will boost serotonin and improve sleep."
-        elif aqi <= 40:
-            status, tip = "Fair", "Air quality is fair. Brief outdoor breaks are beneficial for focus restoration."
-        elif aqi <= 60:
-            status, tip = "Moderate", "Moderate pollution. Limit outdoor exposure if sensitive."
-        else:
-            status, tip = "Poor", "High pollution. Stay indoors and avoid intense outdoor exercise."
-        return {"city": city, "aqi": aqi, "status": status, "tip": tip}
-    except Exception as e:
-        print(f"AQI error (using fallback): {e}")
-        return {"city": city, "aqi": 55, "status": "Moderate", "tip": "Take short outdoor breaks when possible. Fresh air improves concentration."}
+# ─── IN-MEMORY STORAGE (replace with DB in production) ────────────────────────
+user_sessions = {}
+streak_data = {}
+weekly_history = []
 
-# ── Scoring ────────────────────────────────────────────────────────────────────
-def score_sleep(d):
+# ─── SCORING ENGINE ────────────────────────────────────────────────────────────
+def calculate_score(data):
     score = 100
-    hours = float(d.get("sleepHours", 7))
-    quality = int(d.get("sleepQuality", 2))
-    wakeups = int(d.get("wakeUps", 1))
-    if hours < 5: score -= 40
-    elif hours < 6: score -= 25
-    elif hours < 7: score -= 10
-    elif hours > 10: score -= 15
-    score -= (4 - quality) * 8
-    score -= min(wakeups * 5, 25)
-    return max(0, min(100, int(score)))
+    flags = []
 
-def score_stress(d):
-    stress = int(d.get("stressLevel", 2))
-    anxiety = int(d.get("anxietyDays", 3))
-    score = 100 - (stress * 18) - (anxiety * 3)
-    return max(0, min(100, int(score)))
+    # Sleep scoring
+    sleep_hours = float(data.get("sleepHours", 7))
+    sleep_quality = data.get("sleepQuality", "good")
+    if sleep_hours < 5:
+        score -= 20
+        flags.append("critical_sleep")
+    elif sleep_hours < 6:
+        score -= 12
+        flags.append("low_sleep")
+    elif sleep_hours > 9:
+        score -= 5
 
-def score_focus(d):
-    focus = int(d.get("focusLevel", 2))
-    screen = float(d.get("screenTime", 5))
-    social = float(d.get("socialMediaHours", 2))
-    breaks = int(d.get("breakFrequency", 2))
-    score = (focus / 4) * 60
-    score -= max(0, screen - 6) * 3
-    score -= social * 3
-    score += breaks * 6
-    return max(0, min(100, int(score)))
+    quality_map = {"poor": -15, "fair": -8, "good": 0, "excellent": 5}
+    score += quality_map.get(sleep_quality, 0)
 
-def score_physical(d):
-    water = int(d.get("waterIntake", 4))
-    exercise = int(d.get("exerciseFreq", 2))
-    diet = int(d.get("dietQuality", 2))
-    outdoor = float(d.get("outdoorTime", 1))
-    score = min(water / 8 * 35, 35)
-    score += (exercise / 4) * 30
-    score += (diet / 4) * 25
-    score += min(outdoor / 2 * 10, 10)
-    return max(0, min(100, int(score)))
+    # Mental health scoring
+    stress_level = int(data.get("stressLevel", 5))
+    anxiety_freq = data.get("anxietyFrequency", "sometimes")
+    mood = data.get("mood", "neutral")
 
-def score_digital(d):
-    screen = float(d.get("screenTime", 5))
-    social = float(d.get("socialMediaHours", 2))
-    study = float(d.get("studyHours", 4))
-    breaks = int(d.get("breakFrequency", 2))
-    score = 100
-    score -= max(0, screen - 4) * 5
-    score -= max(0, social - 1) * 6
-    score += min(study * 3, 20)
-    score += breaks * 4
-    return max(0, min(100, int(score)))
+    score -= stress_level * 2
 
-def score_mood(d):
-    mood = int(d.get("mood", 2))
-    symptoms = d.get("symptoms", [])
-    score = (mood / 4) * 80
-    score -= len(symptoms) * 3
-    return max(0, min(100, int(score)))
+    anxiety_map = {"never": 5, "rarely": 0, "sometimes": -8, "often": -15, "always": -25}
+    score += anxiety_map.get(anxiety_freq, 0)
 
-def calc_depression_risk(d, scores):
-    risk = 0
-    if float(d.get("sleepHours", 7)) < 6: risk += 20
-    if int(d.get("stressLevel", 2)) >= 3: risk += 20
-    if int(d.get("mood", 2)) <= 1: risk += 25
-    if int(d.get("anxietyDays", 3)) >= 8: risk += 20
-    risk += min(len(d.get("symptoms", [])) * 4, 20)
-    risk = min(risk, 100)
-    if risk < 25: level, note = "Low", "Your mental health indicators look positive. Keep maintaining your healthy habits!"
-    elif risk < 50: level, note = "Moderate", "Some risk factors detected. Prioritise sleep, reduce screen time, and try mindfulness."
-    elif risk < 75: level, note = "Elevated", "Multiple risk factors present. Consider speaking with a counsellor or trusted person."
-    else: level, note = "High", "Significant risk indicators. Please reach out to a mental health professional today."
-    return {"score": risk, "level": level, "note": note}
+    mood_map = {"excellent": 10, "good": 5, "neutral": 0, "low": -10, "very_low": -20}
+    score += mood_map.get(mood, 0)
 
-def analyse_sleep(d):
-    results = []
-    hours = float(d.get("sleepHours", 7))
-    quality = int(d.get("sleepQuality", 2))
-    wakeups = int(d.get("wakeUps", 1))
-    if hours < 6:
-        results.append({"type": "warn", "text": f"Only {hours}h of sleep. Students need 7-9h. Cognitive function drops 30% below 6h."})
-    else:
-        results.append({"type": "good", "text": f"{hours}h sleep is within healthy range. Memory consolidation cycles are completing well."})
-    if quality <= 1:
-        results.append({"type": "warn", "text": "Poor sleep quality. Avoid screens 1h before bed and keep bedroom at 18-20 degrees."})
-    elif quality >= 3:
-        results.append({"type": "good", "text": "Good sleep quality! Deep sleep is essential for learning retention and mood regulation."})
-    if wakeups >= 3:
-        results.append({"type": "warn", "text": f"{wakeups} night wake-ups disrupts REM cycles. Reduce evening caffeine and try 4-7-8 breathing."})
-    results.append({"type": "info", "text": "Sleep repair tip: Shift bedtime 15 min earlier each week for lasting improvement."})
-    return results
+    if stress_level >= 8:
+        flags.append("high_stress")
+    if anxiety_freq in ["often", "always"]:
+        flags.append("high_anxiety")
+    if mood in ["low", "very_low"]:
+        flags.append("low_mood")
 
-def analyse_habits(d):
-    results = []
-    screen = float(d.get("screenTime", 5))
-    social = float(d.get("socialMediaHours", 2))
-    breaks = int(d.get("breakFrequency", 2))
-    study = float(d.get("studyHours", 4))
-    if screen > 8:
-        results.append({"type": "warn", "text": f"{screen}h screen time causes eye strain, melatonin suppression and dopamine dysregulation."})
-    else:
-        results.append({"type": "good", "text": f"Screen time of {screen}h is manageable. Keep blue light exposure low after 8pm."})
-    if social > 3:
-        results.append({"type": "warn", "text": f"{social}h social media exceeds recommended 1-2h. Linked to anxiety and reduced attention span."})
-    if breaks <= 1:
-        results.append({"type": "warn", "text": "Infrequent study breaks detected. Use Pomodoro: 25 min focus + 5 min break."})
-    elif breaks >= 4:
-        results.append({"type": "good", "text": "Excellent break frequency! Spaced rest improves information encoding by up to 40%."})
-    if study >= 6:
-        results.append({"type": "info", "text": f"Studying {study}h/day is intense. Ensure deep work, not passive reading. Use active recall."})
-    return results
+    # Physical scoring
+    exercise_freq = data.get("exerciseFrequency", "sometimes")
+    exercise_map = {"never": -15, "rarely": -8, "sometimes": 0, "regularly": 10, "daily": 15}
+    score += exercise_map.get(exercise_freq, 0)
 
-def get_recommendations(d, scores):
-    recos = []
-    if scores["sleep"] < 60:
-        recos.append({"icon": "😴", "category": "Sleep Repair", "text": "Set a consistent bedtime. Aim for 7-8h. Keep room dark, cool and phone-free."})
-    if scores["focus"] < 60:
-        recos.append({"icon": "🎯", "category": "Focus Booster", "text": "Try Pomodoro Technique: 25 min deep work + 5 min break. Block distracting apps."})
-    if scores["stress"] < 60:
-        recos.append({"icon": "🧘", "category": "Stress Relief", "text": "Practice 4-7-8 breathing daily. Journal for 5 min before bed to clear your mind."})
-    if int(d.get("waterIntake", 4)) < 6:
-        recos.append({"icon": "💧", "category": "Hydration", "text": "Drink at least 8 glasses of water daily. Dehydration reduces cognition by 20%."})
-    if int(d.get("exerciseFreq", 2)) <= 1:
-        recos.append({"icon": "🏃", "category": "Movement", "text": "Even 20-min walks boost BDNF brain growth factor. Start with 3x per week."})
-    if float(d.get("socialMediaHours", 2)) > 2:
-        recos.append({"icon": "📵", "category": "Digital Detox", "text": "Use Focus Mode on phone during study and 1h before sleep. Limit to 2h/day."})
-    if int(d.get("dietQuality", 2)) <= 1:
-        recos.append({"icon": "🥗", "category": "Brain Diet", "text": "Add omega-3 rich foods like walnuts and fish. Avoid sugar spikes before study."})
-    recos.append({"icon": "☀️", "category": "Morning Routine", "text": "10 min sunlight within 30 min of waking resets your circadian rhythm."})
-    recos.append({"icon": "📚", "category": "Study Method", "text": "Use active recall and spaced repetition instead of passive re-reading."})
-    return recos
+    water_intake = int(data.get("waterIntake", 6))
+    if water_intake < 4:
+        score -= 10
+        flags.append("dehydration_risk")
+    elif water_intake >= 8:
+        score += 5
 
-PROVERBS = [
-    "The mind is everything. What you think, you become. - Buddha",
-    "Take care of your body. It is the only place you have to live. - Jim Rohn",
-    "Sleep is the best meditation. - Dalai Lama",
-    "An investment in knowledge pays the best interest. - Benjamin Franklin",
-    "He who has health has hope; and he who has hope has everything. - Arabian Proverb",
-    "Early to bed and early to rise makes a man healthy, wealthy and wise. - Franklin",
-]
+    # Habits scoring
+    screen_time = float(data.get("screenTime", 4))
+    study_hours = float(data.get("studyHours", 4))
+    social_connection = data.get("socialConnection", "moderate")
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
-@app.route("/analyze", methods=["POST", "OPTIONS"])
-def analyze():
-    if request.method == "OPTIONS":
-        return jsonify({}), 200
-    try:
-        d = request.get_json(force=True)
-        print(f"Received data for: {d.get('name', 'Unknown')}")
+    if screen_time > 8:
+        score -= 12
+        flags.append("excessive_screen")
+    elif screen_time > 6:
+        score -= 6
 
-        scores = {
-            "sleep":    score_sleep(d),
-            "focus":    score_focus(d),
-            "stress":   score_stress(d),
-            "physical": score_physical(d),
-            "digital":  score_digital(d),
-            "mood":     score_mood(d),
-        }
+    if study_hours > 10:
+        score -= 10
+        flags.append("study_overload")
 
-        overall = int(np.mean(list(scores.values())))
-        risk = "Low" if overall >= 70 else "Moderate" if overall >= 45 else "High"
-        aqi_data = fetch_aqi(d.get("city", "Chennai"))
+    social_map = {"isolated": -15, "low": -8, "moderate": 0, "high": 8}
+    score += social_map.get(social_connection, 0)
 
-        result = {
-            "name": str(d.get("name", "Student")),
-            "overall_score": overall,
-            "risk_level": risk,
-            "scores": scores,
-            "aqi_data": aqi_data,
-            "sleep_analysis": analyse_sleep(d),
-            "habit_analysis": analyse_habits(d),
-            "depression_risk": calc_depression_risk(d, scores),
-            "recommendations": get_recommendations(d, scores),
-            "proverb": random.choice(PROVERBS),
-            "tip": aqi_data.get("tip", ""),
-            "input": d,
-            "generated_at": datetime.now().isoformat(),
-        }
-        print(f"Analysis complete. Score: {overall}")
-        return jsonify(result)
+    # Clamp score
+    score = max(0, min(100, score))
 
-    except Exception as e:
-        print(f"ERROR in /analyze: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+    # Burnout prediction
+    burnout_risk = "Low"
+    if score < 40 or len([f for f in flags if f in ["high_stress", "critical_sleep", "study_overload"]]) >= 2:
+        burnout_risk = "High"
+        flags.append("burnout_risk")
+    elif score < 60 or len(flags) >= 3:
+        burnout_risk = "Moderate"
+
+    # Depression risk
+    depression_risk = "Low"
+    depression_indicators = ["low_mood", "high_anxiety", "critical_sleep", "isolated"]
+    if sum(1 for f in flags if f in depression_indicators) >= 3:
+        depression_risk = "High"
+    elif sum(1 for f in flags if f in depression_indicators) >= 2:
+        depression_risk = "Moderate"
+
+    return {
+        "overall": round(score),
+        "sleep": max(0, min(100, 100 - abs(sleep_hours - 7.5) * 12 + quality_map.get(sleep_quality, 0))),
+        "mental": max(0, min(100, 100 - stress_level * 5 + anxiety_map.get(anxiety_freq, 0) + mood_map.get(mood, 0))),
+        "physical": max(0, min(100, 60 + exercise_map.get(exercise_freq, 0) + (water_intake - 4) * 3)),
+        "habits": max(0, min(100, 80 - max(0, screen_time - 4) * 5 - max(0, study_hours - 6) * 4)),
+        "flags": flags,
+        "burnout_risk": burnout_risk,
+        "depression_risk": depression_risk
+    }
+
+# ─── ROUTES ────────────────────────────────────────────────────────────────────
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "SynapseGuard backend running", "version": "1.0.0"})
+    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+
+
+@app.route("/api/analyze", methods=["POST"])
+def analyze():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        scores = calculate_score(data)
+        
+        # Get AQI data
+        aqi_data = get_aqi(data.get("latitude", 28.6), data.get("longitude", 77.2))
+        
+        # Generate AI recommendations via Claude
+        recommendations = generate_ai_recommendations(data, scores)
+        
+        # Generate study schedule
+        schedule = generate_study_schedule(data)
+        
+        # Store for weekly history
+        entry = {
+            "date": datetime.now().isoformat(),
+            "scores": scores,
+            "name": data.get("name", "Student")
+        }
+        weekly_history.append(entry)
+        if len(weekly_history) > 7:
+            weekly_history.pop(0)
+
+        # Update streak
+        user_id = data.get("name", "default").lower().replace(" ", "_")
+        update_streak(user_id)
+
+        return jsonify({
+            "success": True,
+            "scores": scores,
+            "aqi": aqi_data,
+            "recommendations": recommendations,
+            "schedule": schedule,
+            "streak": streak_data.get(user_id, {}).get("count", 1),
+            "weekly_history": weekly_history[-7:],
+            "emergency_resources": get_emergency_resources(scores),
+            "challenges": generate_challenges(scores),
+            "timestamp": datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        print(f"Error in /api/analyze: {e}")
+        return jsonify({"error": str(e), "success": False}), 500
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    try:
+        body = request.get_json()
+        messages = body.get("messages", [])
+        context = body.get("context", {})
+
+        system_prompt = f"""You are SynapseGuard AI, a compassionate and expert cognitive health assistant for students. 
+        You provide evidence-based advice on mental health, study habits, sleep, stress management, and academic wellbeing.
+        
+        Current user context: {json.dumps(context)}
+        
+        Be warm, supportive, concise (2-3 paragraphs max), and always recommend professional help for serious concerns.
+        Use emojis sparingly. Never diagnose. Always be encouraging."""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            system=system_prompt,
+            messages=messages
+        )
+
+        return jsonify({
+            "reply": response.content[0].text,
+            "success": True
+        })
+
+    except Exception as e:
+        print(f"Chat error: {e}")
+        return jsonify({"error": str(e), "success": False}), 500
+
+
+@app.route("/api/weekly", methods=["GET"])
+def weekly():
+    # Generate demo weekly data if empty
+    if len(weekly_history) < 3:
+        base = 65
+        demo = []
+        for i in range(7):
+            date = datetime.now() - timedelta(days=6-i)
+            demo.append({
+                "date": date.strftime("%a"),
+                "overall": max(30, min(95, base + random.randint(-10, 10))),
+                "sleep": max(30, min(95, base + random.randint(-15, 15))),
+                "mental": max(30, min(95, base + random.randint(-12, 12))),
+            })
+            base = demo[-1]["overall"]
+        return jsonify({"data": demo})
+    
+    return jsonify({"data": [
+        {
+            "date": datetime.fromisoformat(h["date"]).strftime("%a"),
+            "overall": h["scores"]["overall"],
+            "sleep": h["scores"]["sleep"],
+            "mental": h["scores"]["mental"]
+        } for h in weekly_history
+    ]})
+
+
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+def get_aqi(lat=28.6, lon=77.2):
+    try:
+        url = f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat}&longitude={lon}&current=us_aqi,pm2_5,pm10"
+        r = requests.get(url, timeout=5)
+        d = r.json()
+        aqi = d.get("current", {}).get("us_aqi", 75)
+        pm25 = d.get("current", {}).get("pm2_5", 15)
+        
+        if aqi <= 50: label, color = "Good", "#00e676"
+        elif aqi <= 100: label, color = "Moderate", "#ffea00"
+        elif aqi <= 150: label, color = "Unhealthy for Sensitive", "#ff9100"
+        elif aqi <= 200: label, color = "Unhealthy", "#f44336"
+        else: label, color = "Very Unhealthy", "#9c27b0"
+        
+        return {"aqi": aqi, "pm25": round(pm25, 1), "label": label, "color": color}
+    except:
+        return {"aqi": 75, "pm25": 12.5, "label": "Moderate", "color": "#ffea00"}
+
+
+def generate_ai_recommendations(data, scores):
+    try:
+        prompt = f"""Student health data: {json.dumps(data)}
+Health scores: {json.dumps(scores)}
+
+Generate exactly 5 personalized, actionable recommendations as a JSON array. Each item:
+{{"category": "Sleep|Mental|Physical|Habits|Nutrition", "priority": "high|medium|low", "title": "short title", "tip": "2-sentence actionable advice", "emoji": "relevant emoji"}}
+
+Return ONLY valid JSON array, no markdown."""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        text = response.content[0].text.strip()
+        # Clean JSON
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        return json.loads(text)
+    except Exception as e:
+        print(f"AI rec error: {e}")
+        return get_fallback_recommendations(scores)
+
+
+def get_fallback_recommendations(scores):
+    recs = []
+    if scores["sleep"] < 60:
+        recs.append({"category": "Sleep", "priority": "high", "title": "Fix Your Sleep Schedule",
+                     "tip": "Aim for 7-9 hours by sleeping and waking at consistent times. Avoid screens 1 hour before bed.", "emoji": "😴"})
+    if scores["mental"] < 60:
+        recs.append({"category": "Mental", "priority": "high", "title": "Stress Reset Protocol",
+                     "tip": "Practice 4-7-8 breathing: inhale 4s, hold 7s, exhale 8s. Do this 3x when stressed.", "emoji": "🧘"})
+    if scores["physical"] < 60:
+        recs.append({"category": "Physical", "priority": "medium", "title": "Move More",
+                     "tip": "Even 20 minutes of brisk walking daily boosts cognition by 30%. Start tomorrow morning.", "emoji": "🏃"})
+    recs.append({"category": "Habits", "priority": "medium", "title": "Hydration Challenge",
+                 "tip": "Drink 8 glasses of water daily. Dehydration reduces focus by up to 20%.", "emoji": "💧"})
+    recs.append({"category": "Nutrition", "priority": "low", "title": "Brain Foods",
+                 "tip": "Add walnuts, blueberries, and dark chocolate to your diet for enhanced memory and mood.", "emoji": "🫐"})
+    return recs[:5]
+
+
+def generate_study_schedule(data):
+    study_hours = float(data.get("studyHours", 6))
+    sleep_hours = float(data.get("sleepHours", 7))
+    
+    # Pomodoro-based schedule
+    sessions = min(8, int(study_hours * 60 / 25))
+    wake_time = 6 if sleep_hours >= 7 else 7
+    
+    return {
+        "wake_time": f"{wake_time}:00 AM",
+        "study_sessions": sessions,
+        "technique": "Pomodoro (25 min focus + 5 min break)",
+        "schedule": [
+            {"time": "6:00-6:30", "activity": "Morning routine + hydration", "type": "wellness"},
+            {"time": "6:30-8:00", "activity": "Deep focus study block (peak cognition)", "type": "study"},
+            {"time": "8:00-9:00", "activity": "Breakfast + light walk", "type": "break"},
+            {"time": "9:00-12:00", "activity": "Core study sessions (Pomodoro)", "type": "study"},
+            {"time": "12:00-1:00", "activity": "Lunch + power nap (20 min)", "type": "break"},
+            {"time": "1:00-4:00", "activity": "Review & practice problems", "type": "study"},
+            {"time": "4:00-5:00", "activity": "Exercise / outdoor time", "type": "wellness"},
+            {"time": "5:00-7:00", "activity": "Light review + reading", "type": "study"},
+            {"time": "7:00-9:00", "activity": "Dinner + relaxation", "type": "break"},
+            {"time": "9:00-10:00", "activity": "Wind-down routine (no screens)", "type": "wellness"},
+            {"time": f"{wake_time + int(sleep_hours)}:00", "activity": "Sleep (non-negotiable!)", "type": "sleep"}
+        ]
+    }
+
+
+def generate_challenges(scores):
+    challenges = [
+        {"id": 1, "title": "7-Day Sleep Warrior", "description": "Sleep 7+ hours for 7 consecutive days", "xp": 500, "icon": "🌙"},
+        {"id": 2, "title": "Hydration Hero", "description": "Drink 8 glasses of water daily for 5 days", "xp": 300, "icon": "💧"},
+        {"id": 3, "title": "Mindful Minutes", "description": "Meditate for 10 minutes each day this week", "xp": 400, "icon": "🧘"},
+        {"id": 4, "title": "Movement Master", "description": "Exercise for 30 minutes, 4 times this week", "xp": 450, "icon": "🏃"},
+        {"id": 5, "title": "Screen Detox", "description": "No screens after 10 PM for 5 days", "xp": 350, "icon": "📵"},
+    ]
+    # Prioritize challenges based on weak scores
+    if scores["sleep"] < 60:
+        challenges[0]["priority"] = True
+    if scores["physical"] < 60:
+        challenges[3]["priority"] = True
+    return challenges
+
+
+def get_emergency_resources(scores):
+    if scores.get("depression_risk") == "High" or scores["overall"] < 35:
+        return {
+            "show": True,
+            "message": "Your responses suggest you may be going through a difficult time. Please reach out — you're not alone.",
+            "resources": [
+                {"name": "iCall (India)", "number": "9152987821", "available": "Mon-Sat, 8am-10pm"},
+                {"name": "Vandrevala Foundation", "number": "1860-2662-345", "available": "24/7"},
+                {"name": "NIMHANS Helpline", "number": "080-46110007", "available": "24/7"},
+                {"name": "Crisis Text Line", "number": "Text HOME to 741741", "available": "24/7"},
+            ]
+        }
+    return {"show": False}
+
+
+def update_streak(user_id):
+    today = datetime.now().date().isoformat()
+    if user_id not in streak_data:
+        streak_data[user_id] = {"count": 1, "last_date": today}
+    else:
+        last = streak_data[user_id]["last_date"]
+        yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
+        if last == yesterday:
+            streak_data[user_id]["count"] += 1
+        elif last != today:
+            streak_data[user_id]["count"] = 1
+        streak_data[user_id]["last_date"] = today
+
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000, host="0.0.0.0")
+    app.run(debug=True, port=5000)
